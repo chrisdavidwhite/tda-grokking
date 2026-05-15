@@ -20,6 +20,7 @@ Runtime: ~22s per run on CPU for d=1. d=2 raises the cost of compute_ph
 (VR up to H_2). For d ≥ 3, expect minutes per checkpoint in §5.
 """
 
+import os
 import time
 import warnings
 from collections import defaultdict
@@ -65,7 +66,7 @@ plt.rcParams.update({
 C = {"grokked": "#1d4ed8", "memorised": "#dc2626",
      "h0": "#7c3aed", "h1": "#059669", "accent": "#f59e0b"}
 
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# DEVICE is set after MODULI/TRAIN_FRAC below (the MPS branch needs train_n).
 
 # All figures land here, regardless of cwd when the script is invoked.
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -80,14 +81,14 @@ def figpath(name):
 # ── §1. Group, dataset, model ─────────────────────────────────────────────
 # MODULI is the master knob. len(MODULI) = d = expected number of circles
 # in the grokked weight cloud. β_k predicted = C(d, k).
-MODULI     = [11,11]           # try [17, 17] for T^2, [11, 11, 11] for T^3, ...
+MODULI     = [47]           # try [17, 17] for T^2, [11, 11, 11] for T^3, ...
 TRAIN_FRAC = 0.40
 HIDDEN     = 128
 N_EPOCHS   = 12_000
 LR         = 1e-3
 WD_GROK    = 5.0
 WD_MEM     = 0.0
-N_RUNS     = 6
+N_RUNS     = 50
 
 # Derived
 D       = len(MODULI)
@@ -99,6 +100,24 @@ CKPT_EPOCHS = sorted(set(
     [1, 5, 10, 25, 50, 100, 200, 500]
     + list(np.unique(np.logspace(np.log10(500), np.log10(N_EPOCHS), 35).astype(int)))
 ))
+
+
+def _pick_device():
+    """Choose cuda/mps/cpu. CPU is the default on Mac: on M1 Max the
+    eventual sweep parallelism (50 independent runs) beats MPS even at
+    d=2, and MPS is strictly worse at d=1. CUDA is used automatically
+    when available. Force MPS with GROK_DEVICE=mps if you want to test
+    it on a different machine."""
+    override = os.environ.get("GROK_DEVICE", "").strip().lower()
+    if override:
+        return torch.device(override)
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    return torch.device("cpu")
+
+
+DEVICE = _pick_device()
+print(f"[device] {DEVICE}")
 
 
 def make_dataset(moduli=None, frac=TRAIN_FRAC, seed=0):
