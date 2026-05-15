@@ -20,6 +20,7 @@ Runtime: ~22s per run on CPU for d=1. d=2 raises the cost of compute_ph
 (VR up to H_2). For d ≥ 3, expect minutes per checkpoint in §5.
 """
 
+import multiprocessing as mp
 import os
 import time
 import warnings
@@ -69,9 +70,9 @@ C = {"grokked": "#1d4ed8", "memorised": "#dc2626",
 # DEVICE is set after MODULI/TRAIN_FRAC below (the MPS branch needs train_n).
 
 # All figures land here, regardless of cwd when the script is invoked.
+# FIG_DIR is set after MODULI/N_EPOCHS/TRAIN_FRAC are known (it embeds them
+# in the path so different sweeps don't overwrite each other's plots).
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-FIG_DIR      = PROJECT_ROOT / "Figures"
-FIG_DIR.mkdir(exist_ok=True)
 
 
 def figpath(name):
@@ -117,7 +118,56 @@ def _pick_device():
 
 
 DEVICE = _pick_device()
-print(f"[device] {DEVICE}")
+if mp.current_process().name == "MainProcess":
+    print(f"[device] {DEVICE}")
+
+
+def _run_tag():
+    """Subdirectory name for this run's figures. Embeds the hyperparameters
+    that change between experiments so plots aren't silently overwritten."""
+    moduli_str = "x".join(str(m) for m in MODULI)
+    return f"M{moduli_str}_E{N_EPOCHS}_F{TRAIN_FRAC:.2f}"
+
+
+FIG_DIR = PROJECT_ROOT / "Figures" / _run_tag()
+FIG_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _pick_workers():
+    """Pool size for parallel runs. CPU-only by default — a single GPU
+    context can't run K trainings in parallel, so we don't try.
+    Override with GROK_WORKERS=N."""
+    override = os.environ.get("GROK_WORKERS", "").strip()
+    if override:
+        return max(1, int(override))
+    if DEVICE.type != "cpu":
+        return 1
+    return min(N_RUNS, os.cpu_count() or 1)
+
+
+def _worker_init():
+    """Pin BLAS to 1 thread per worker so K workers × T threads
+    don't oversubscribe the CPU."""
+    torch.set_num_threads(1)
+
+
+def _train_run_task(args):
+    wd, seed = args
+    t1 = time.time()
+    hist, ckpts = train_run(
+        moduli=MODULI, hidden=HIDDEN, n_epochs=N_EPOCHS,
+        lr=LR, weight_decay=wd, ckpt_epochs=CKPT_EPOCHS, seed=seed,
+    )
+    return seed, hist, ckpts, time.time() - t1
+
+
+def _compute_tda_task(args):
+    cond, ri, epoch, W, max_dim = args
+    dgms = compute_ph(W, max_dim=max_dim)
+    rec  = summarise(dgms)
+    rec["epoch"] = epoch
+    rec["dgms"]  = dgms
+    return cond, ri, epoch, rec
 
 
 def make_dataset(moduli=None, frac=TRAIN_FRAC, seed=0):
@@ -306,20 +356,39 @@ def train_run(moduli, hidden, n_epochs, lr, weight_decay, ckpt_epochs, seed=0):
 def train_all():
     runs = {"grokked": [], "memorised": []}
     t0   = time.time()
+    n_workers = _pick_workers()
+    use_pool  = n_workers > 1
     for cond, wd in [("grokked", WD_GROK), ("memorised", WD_MEM)]:
-        print(f"\n── {cond.upper()}  (weight_decay={wd}) ──")
-        for i in range(N_RUNS):
-            t1 = time.time()
-            hist, ckpts = train_run(
-                moduli=MODULI, hidden=HIDDEN, n_epochs=N_EPOCHS,
-                lr=LR, weight_decay=wd,
-                ckpt_epochs=CKPT_EPOCHS, seed=i,
-            )
+        tag = f"pool={n_workers}" if use_pool else "serial"
+        print(f"\n── {cond.upper()}  (weight_decay={wd})  [{tag}] ──")
+        tasks = [(wd, i) for i in range(N_RUNS)]
+        collected = []
+        if use_pool:
+            with mp.Pool(n_workers, initializer=_worker_init) as pool:
+                done = 0
+                for seed, hist, ckpts, dt in pool.imap_unordered(_train_run_task, tasks):
+                    done += 1
+                    print(f"  [{done:2d}/{N_RUNS}] seed={seed:2d}  "
+                          f"train_acc={hist['train_acc'][-1]:.3f}  "
+                          f"test_acc={hist['test_acc'][-1]:.3f}  "
+                          f"[{dt:.0f}s]")
+                    collected.append((seed, hist, ckpts))
+        else:
+            for i in range(N_RUNS):
+                t1 = time.time()
+                hist, ckpts = train_run(
+                    moduli=MODULI, hidden=HIDDEN, n_epochs=N_EPOCHS,
+                    lr=LR, weight_decay=wd,
+                    ckpt_epochs=CKPT_EPOCHS, seed=i,
+                )
+                collected.append((i, hist, ckpts))
+                print(f'  run {i+1:2d}/{N_RUNS}  '
+                      f'train_acc={hist["train_acc"][-1]:.3f}  '
+                      f'test_acc={hist["test_acc"][-1]:.3f}  '
+                      f'[{time.time()-t1:.0f}s]')
+        collected.sort(key=lambda r: r[0])
+        for _, hist, ckpts in collected:
             runs[cond].append({"history": hist, "checkpoints": ckpts})
-            print(f'  run {i+1:2d}/{N_RUNS}  '
-                  f'train_acc={hist["train_acc"][-1]:.3f}  '
-                  f'test_acc={hist["test_acc"][-1]:.3f}  '
-                  f'[{time.time()-t1:.0f}s]')
     print(f"\nTotal training time: {(time.time()-t0)/60:.1f} min")
     return runs
 
@@ -357,21 +426,31 @@ TDA_LAYER = "W2"
 
 
 def compute_tda(runs, layer=TDA_LAYER, max_dim=MAX_DIM):
-    print(f"Computing persistence diagrams for {layer}  (max_dim={max_dim})...")
-    t0  = time.time()
-    tda = {"grokked": [], "memorised": []}
+    n_workers = _pick_workers()
+    use_pool  = n_workers > 1
+    tag = f"pool={n_workers}" if use_pool else "serial"
+    print(f"Computing persistence diagrams for {layer}  (max_dim={max_dim})  [{tag}] ...")
+    t0 = time.time()
+
+    tasks = []
     for cond in ("grokked", "memorised"):
         for ri, run in enumerate(runs[cond]):
-            run_tda = []
             for epoch in sorted(run["checkpoints"]):
-                W    = run["checkpoints"][epoch]["weights"][layer]
-                dgms = compute_ph(W, max_dim=max_dim)
-                rec  = summarise(dgms)
-                rec["epoch"] = epoch
-                rec["dgms"]  = dgms
-                run_tda.append(rec)
-            tda[cond].append(run_tda)
-            print(f"  {cond} run {ri+1}/{N_RUNS}")
+                W = run["checkpoints"][epoch]["weights"][layer]
+                tasks.append((cond, ri, epoch, W, max_dim))
+
+    if use_pool:
+        with mp.Pool(n_workers, initializer=_worker_init) as pool:
+            results = list(pool.imap_unordered(_compute_tda_task, tasks))
+    else:
+        results = [_compute_tda_task(t) for t in tasks]
+
+    tda = {cond: [[] for _ in runs[cond]] for cond in ("grokked", "memorised")}
+    for cond, ri, _, rec in results:
+        tda[cond][ri].append(rec)
+    for cond in tda:
+        for ri in range(len(tda[cond])):
+            tda[cond][ri].sort(key=lambda r: r["epoch"])
     print(f"Done in {time.time()-t0:.1f}s")
     return tda
 
@@ -833,6 +912,12 @@ def plot_barcodes(runs, savename="fig_barcodes.png"):
 
 # ── Main ──────────────────────────────────────────────────────────────────
 def main():
+    # spawn is the macOS default since 3.8; set explicitly so behaviour
+    # is identical on Linux (where fork+torch can deadlock libomp).
+    try:
+        mp.set_start_method("spawn")
+    except RuntimeError:
+        pass
     print(f"Device : {DEVICE}")
     print(f"PyTorch: {torch.__version__}")
     print(f"Ripser : {ripser.__version__}")
