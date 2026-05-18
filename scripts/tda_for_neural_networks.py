@@ -79,23 +79,46 @@ def figpath(name):
     return str(FIG_DIR / name)
 
 
-# ── §1. Group, dataset, model ─────────────────────────────────────────────
-# MODULI is the master knob. len(MODULI) = d = expected number of circles
-# in the grokked weight cloud. β_k predicted = C(d, k).
-MODULI     = [47]           # try [17, 17] for T^2, [11, 11, 11] for T^3, ...
-TRAIN_FRAC = 0.40
-HIDDEN     = 128
-N_EPOCHS   = 12_000
-LR         = 1e-3
-WD_GROK    = 5.0
-WD_MEM     = 0.0
-N_RUNS     = 50
+# ── §1. Task selector, hyperparameters, derived constants ────────────────
+# TASK is the master switch between modular-addition (default), modular-
+# multiplication on (Z/p)*, and sparse parity. Set via GROK_TASK env var;
+# spawn workers inherit it, so the wrapper scripts only have to set it
+# once in the parent process.
+TASK = os.environ.get("GROK_TASK", "add").strip().lower()
+if TASK not in ("add", "mul", "sparse_parity"):
+    raise ValueError(f"GROK_TASK must be one of add/mul/sparse_parity; got {TASK!r}")
 
-# Derived
-D       = len(MODULI)
-IN_DIM  = 2 * sum(MODULI)
-OUT_DIM = sum(MODULI)
-MAX_DIM = D                 # how many homology dims compute_ph evaluates
+# Hyperparameters — env-var-overridable so wrapper scripts can tune per task
+# without editing this file.
+MODULI     = [47]           # add/mul only. d=2 attempts archived in repo.
+TRAIN_FRAC = 0.40           # add/mul only.
+HIDDEN     = int(os.environ.get("GROK_HIDDEN",   "128"))
+N_EPOCHS   = int(os.environ.get("GROK_N_EPOCHS", "12000"))
+N_RUNS     = int(os.environ.get("GROK_N_RUNS",   "50"))
+LR         = float(os.environ.get("GROK_LR",       "1e-3"))
+WD_GROK    = float(os.environ.get("GROK_WD_GROK",  "5.0"))
+WD_MEM     = float(os.environ.get("GROK_WD_MEM",   "0.0"))
+
+# Sparse-parity-specific hyperparameters (ignored for add/mul).
+SP_N_BITS  = int(os.environ.get("SP_N_BITS", "40"))
+SP_K       = int(os.environ.get("SP_K",      "3"))
+SP_TRAIN   = int(os.environ.get("SP_TRAIN",  "1024"))
+
+# Derived constants. EFFECTIVE_MODULI is the "head-split" passed to
+# multi_loss / multi_acc — for sparse parity it's [2] (binary single head);
+# for add/mul it equals MODULI.
+if TASK == "sparse_parity":
+    D                = 1
+    IN_DIM           = SP_N_BITS
+    OUT_DIM          = 2
+    EFFECTIVE_MODULI = [2]
+    MAX_DIM          = 1
+else:
+    D                = len(MODULI)
+    IN_DIM           = 2 * sum(MODULI)
+    OUT_DIM          = sum(MODULI)
+    EFFECTIVE_MODULI = list(MODULI)
+    MAX_DIM          = D
 
 CKPT_EPOCHS = sorted(set(
     [1, 5, 10, 25, 50, 100, 200, 500]
@@ -125,8 +148,19 @@ if mp.current_process().name == "MainProcess":
 def _run_tag():
     """Subdirectory name for this run's figures. Embeds the hyperparameters
     that change between experiments so plots aren't silently overwritten."""
+    if TASK == "sparse_parity":
+        return f"SP_n{SP_N_BITS}_k{SP_K}_T{SP_TRAIN}_E{N_EPOCHS}"
     moduli_str = "x".join(str(m) for m in MODULI)
-    return f"M{moduli_str}_E{N_EPOCHS}_F{TRAIN_FRAC:.2f}"
+    prefix = "Mul" if TASK == "mul" else "M"
+    return f"{prefix}{moduli_str}_E{N_EPOCHS}_F{TRAIN_FRAC:.2f}"
+
+
+def _task_label():
+    """Short human-readable description of the current task, for plot titles."""
+    if TASK == "sparse_parity":
+        return f"sparse parity n={SP_N_BITS}, k={SP_K}"
+    op = "·" if TASK == "mul" else "+"
+    return f"MODULI={MODULI} ({op} mod p)"
 
 
 FIG_DIR = PROJECT_ROOT / "Figures" / _run_tag()
@@ -170,7 +204,22 @@ def _compute_tda_task(args):
     return cond, ri, epoch, rec
 
 
-def make_dataset(moduli=None, frac=TRAIN_FRAC, seed=0):
+def make_dataset(moduli=None, frac=None, seed=0):
+    """Dispatch to the task-appropriate dataset constructor.
+
+    Returns ((X_train, y_train), (X_test, y_test)) for the current TASK.
+    Workers re-import this module on spawn and see the same TASK via env
+    var, so all replicas agree on which dataset to build."""
+    if frac is None:
+        frac = TRAIN_FRAC
+    if TASK == "sparse_parity":
+        return _make_dataset_sparse_parity(seed=seed)
+    if TASK == "mul":
+        return _make_dataset_mul(moduli=moduli, frac=frac, seed=seed)
+    return _make_dataset_add(moduli=moduli, frac=frac, seed=seed)
+
+
+def _make_dataset_add(moduli=None, frac=TRAIN_FRAC, seed=0):
     """G = Z/m_1 × ... × Z/m_d.  Inputs are pairs (a, b) in G × G,
     encoded as concatenated one-hots over each factor (2 * sum(moduli) dims).
     Labels are (a + b) mod m_i per factor, shape (N, d)."""
@@ -198,17 +247,66 @@ def make_dataset(moduli=None, frac=TRAIN_FRAC, seed=0):
     return enc(idx[:n]), enc(idx[n:])
 
 
-class GrokMLP(nn.Module):
-    """Three-layer MLP with multi-head output: one softmax head per cyclic factor.
-    For d = 1 this collapses to a single p-way classifier, matching the original."""
+def _make_dataset_mul(moduli=None, frac=TRAIN_FRAC, seed=0):
+    """Modular multiplication on (Z/p)*: (a, b) -> a*b mod p with a, b in
+    {1, ..., p-1}. Inputs are one-hot pairs of length 2p (with the zero
+    index always silent). Single-prime (d=1) only."""
+    if moduli is None:
+        moduli = MODULI
+    if len(moduli) != 1:
+        raise ValueError(f"TASK=mul requires len(MODULI)=1, got MODULI={moduli}")
+    p = moduli[0]
+    rng    = np.random.default_rng(seed)
+    pair_i = np.array(list(iproduct(range(1, p), range(1, p))))      # ((p-1)^2, 2)
+    a      = pair_i[:, 0]
+    b      = pair_i[:, 1]
+    labels = (a * b) % p                                              # ((p-1)^2,)
 
-    def __init__(self, moduli=None, hidden=HIDDEN):
+    idx = rng.permutation(len(pair_i))
+    n   = int(frac * len(pair_i))
+
+    def enc(ix):
+        a_oh = F.one_hot(torch.tensor(a[ix]), p).float()
+        b_oh = F.one_hot(torch.tensor(b[ix]), p).float()
+        X    = torch.cat([a_oh, b_oh], dim=1)
+        y    = torch.tensor(labels[ix], dtype=torch.long).unsqueeze(1)
+        return X, y
+
+    return enc(idx[:n]), enc(idx[n:])
+
+
+def _make_dataset_sparse_parity(seed=0):
+    """Sparse parity: random {0,1} vectors of length SP_N_BITS; the label
+    is the XOR of SP_K fixed (secret) bits. The secret subset is fixed
+    across seeds (so all 50 replicas solve the same task and the
+    statistics are over init/data shuffle only)."""
+    # Fixed secret subset — same task for every replica.
+    secret = np.random.default_rng(0xC051).choice(SP_N_BITS, size=SP_K, replace=False)
+    rng    = np.random.default_rng(seed)
+    n_test = max(SP_TRAIN, 4096)
+    bits   = rng.integers(0, 2, size=(SP_TRAIN + n_test, SP_N_BITS), dtype=np.int64)
+    parity = bits[:, secret].sum(axis=1) % 2
+
+    X = torch.tensor(bits, dtype=torch.float32)
+    y = torch.tensor(parity, dtype=torch.long).unsqueeze(1)
+    return (X[:SP_TRAIN], y[:SP_TRAIN]), (X[SP_TRAIN:], y[SP_TRAIN:])
+
+
+class GrokMLP(nn.Module):
+    """Three-layer MLP with multi-head output. For add/mul, each cyclic
+    factor gets its own softmax head (size m_i); for sparse parity, a
+    single binary head. The caller can pass explicit in_dim/out_dim to
+    override the moduli-derived defaults (required when TASK!='add'/'mul')."""
+
+    def __init__(self, moduli=None, hidden=HIDDEN, in_dim=None, out_dim=None):
         super().__init__()
         if moduli is None:
-            moduli = MODULI
+            moduli = EFFECTIVE_MODULI
         self.moduli = list(moduli)
-        in_dim  = 2 * sum(self.moduli)
-        out_dim = sum(self.moduli)
+        if in_dim is None:
+            in_dim = IN_DIM
+        if out_dim is None:
+            out_dim = OUT_DIM
         self.fc1 = nn.Linear(in_dim, hidden)
         self.fc2 = nn.Linear(hidden, hidden)
         self.fc3 = nn.Linear(hidden, out_dim)
@@ -316,7 +414,11 @@ def train_run(moduli, hidden, n_epochs, lr, weight_decay, ckpt_epochs, seed=0):
     Xtr, ytr = Xtr.to(DEVICE), ytr.to(DEVICE)
     Xte, yte = Xte.to(DEVICE), yte.to(DEVICE)
 
-    model = GrokMLP(moduli=moduli, hidden=hidden).to(DEVICE)
+    # in/out dims are TASK-derived module globals; the `moduli` arg is the
+    # head-split (= EFFECTIVE_MODULI), used for the multi_loss / multi_acc
+    # call sites below. Pass it through to GrokMLP for label-keeping only.
+    model = GrokMLP(moduli=EFFECTIVE_MODULI, hidden=hidden,
+                    in_dim=IN_DIM, out_dim=OUT_DIM).to(DEVICE)
     opt   = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
 
     ckpt_set = set(ckpt_epochs)
@@ -326,7 +428,7 @@ def train_run(moduli, hidden, n_epochs, lr, weight_decay, ckpt_epochs, seed=0):
     for epoch in range(1, n_epochs + 1):
         model.train()
         opt.zero_grad()
-        multi_loss(model(Xtr), ytr, moduli).backward()
+        multi_loss(model(Xtr), ytr, EFFECTIVE_MODULI).backward()
         opt.step()
 
         if epoch % 200 == 0 or epoch in ckpt_set:
@@ -334,10 +436,10 @@ def train_run(moduli, hidden, n_epochs, lr, weight_decay, ckpt_epochs, seed=0):
             with torch.no_grad():
                 tr_logits = model(Xtr)
                 te_logits = model(Xte)
-                tr_loss = multi_loss(tr_logits, ytr, moduli).item()
-                te_loss = multi_loss(te_logits, yte, moduli).item()
-                tr_acc  = multi_acc(tr_logits, ytr, moduli)
-                te_acc  = multi_acc(te_logits, yte, moduli)
+                tr_loss = multi_loss(tr_logits, ytr, EFFECTIVE_MODULI).item()
+                te_loss = multi_loss(te_logits, yte, EFFECTIVE_MODULI).item()
+                tr_acc  = multi_acc(tr_logits, ytr, EFFECTIVE_MODULI)
+                te_acc  = multi_acc(te_logits, yte, EFFECTIVE_MODULI)
             history["epoch"].append(epoch)
             history["train_loss"].append(tr_loss)
             history["test_loss"].append(te_loss)
@@ -414,7 +516,7 @@ def plot_learning_curves(runs, savename="fig_learning_curves.png"):
         if "acc" in metric:
             ax.set_ylim(-0.05, 1.05)
         ax.legend()
-    fig.suptitle(f"Learning Curves  (MODULI={MODULI}, WD_grok={WD_GROK})",
+    fig.suptitle(f"Learning Curves  ({_task_label()}, WD_grok={WD_GROK})",
                  fontsize=14, fontweight="bold", y=1.02)
     plt.tight_layout()
     plt.savefig(figpath(savename))
@@ -490,7 +592,7 @@ def plot_tda_dynamics(tda, runs, layer=TDA_LAYER, savename="fig_tda_dynamics.png
                 ax.set_ylabel(label)
             ax.legend(fontsize=8)
     fig.suptitle(f"Topological Complexity vs Epoch  [{layer}]   "
-                 f"MODULI={MODULI}  (dashed gold = grokking epoch per run)",
+                 f"{_task_label()}  (dashed gold = grokking epoch per run)",
                  fontsize=13, fontweight="bold", y=1.01)
     plt.tight_layout()
     plt.savefig(figpath(savename))
@@ -528,7 +630,7 @@ def plot_betti_trajectories(tda, runs, layer=TDA_LAYER, savename="fig_betti_traj
         ax.set_ylabel(label)
         ax.set_title(label)
         ax.legend()
-    fig.suptitle(f"Betti Numbers at ε={THRESH:.3f}  [{layer}]   MODULI={MODULI}",
+    fig.suptitle(f"Betti Numbers at ε={THRESH:.3f}  [{layer}]   {_task_label()}",
                  fontsize=14, fontweight="bold")
     plt.tight_layout()
     plt.savefig(figpath(savename))
@@ -607,7 +709,7 @@ def plot_grokking_transition(tda, runs, dim=1, savename="fig_grokking_transition
     axes[1, 0].set_ylabel(f"H_{dim} Barcode", fontsize=8)
     axes[2, 0].set_ylabel("Metrics (norm)", fontsize=8)
     fig.suptitle(f"Topological Snapshots Around Grokking Transition (run {grok_ri+1})  "
-                 f"H_{dim}   MODULI={MODULI}",
+                 f"H_{dim}   {_task_label()}",
                  fontsize=13, fontweight="bold")
     plt.tight_layout()
     plt.savefig(figpath(savename))
@@ -647,7 +749,7 @@ def plot_persistence_diagrams(tda, runs, layer=TDA_LAYER, savename="fig_persiste
                 ax.set_ylabel(f"{cond}\n{dimlab}", fontsize=8, color=C[cond])
             if row == nrows - 1:
                 ax.set_xlabel(f"run {col+1}  te={te:.2f}", fontsize=7)
-    fig.suptitle(f"Persistence Diagrams at Convergence  [{layer}]   MODULI={MODULI}",
+    fig.suptitle(f"Persistence Diagrams at Convergence  [{layer}]   {_task_label()}",
                  fontsize=13, fontweight="bold")
     plt.tight_layout()
     plt.savefig(figpath(savename))
@@ -793,7 +895,7 @@ def plot_layerwise(runs, savename="fig_layerwise.png"):
 def statistical_comparison(tda, layer=TDA_LAYER):
     print("=" * 76)
     print(f"Statistical comparison: Grokked vs Memorised  [{layer} at convergence]  "
-          f"MODULI={MODULI}")
+          f"{_task_label()}")
     print("=" * 76)
     print(f'{"Metric":<22}  {"Grokked (μ±σ)":>18}  {"Memorised (μ±σ)":>18}  {"p":>8}  Sig')
     print("-" * 76)
@@ -911,6 +1013,20 @@ def plot_barcodes(runs, savename="fig_barcodes.png"):
 
 
 # ── Main ──────────────────────────────────────────────────────────────────
+class _StdoutTee:
+    """Mirror writes to multiple streams so we can capture the run log to
+    a file while still showing it on the terminal. Restored on context exit."""
+    def __init__(self, *streams):
+        self._streams = streams
+    def write(self, data):
+        for s in self._streams:
+            s.write(data)
+            s.flush()
+    def flush(self):
+        for s in self._streams:
+            s.flush()
+
+
 def main():
     # spawn is the macOS default since 3.8; set explicitly so behaviour
     # is identical on Linux (where fork+torch can deadlock libomp).
@@ -918,10 +1034,29 @@ def main():
         mp.set_start_method("spawn")
     except RuntimeError:
         pass
+
+    # Save stdout to FIG_DIR/run.log so each run is self-documenting next
+    # to its figures. Workers print via the parent's pool callback, so the
+    # parent-only tee captures all the relevant output. Restored on exit.
+    import sys
+    log_path = FIG_DIR / "run.log"
+    log_file = open(log_path, "w", buffering=1)
+    original_stdout = sys.stdout
+    sys.stdout = _StdoutTee(original_stdout, log_file)
+    try:
+        _run_main()
+    finally:
+        sys.stdout = original_stdout
+        log_file.close()
+
+
+def _run_main():
     print(f"Device : {DEVICE}")
     print(f"PyTorch: {torch.__version__}")
     print(f"Ripser : {ripser.__version__}")
-    print(f"MODULI : {MODULI}   (d={D}, |G|={int(np.prod(MODULI))})")
+    print(f"Task   : {TASK}   ({_task_label()})")
+    if TASK in ("add", "mul"):
+        print(f"MODULI : {MODULI}   (d={D}, |G|={int(np.prod(MODULI))})")
     print(f"In/Out : {IN_DIM} -> {HIDDEN} -> {HIDDEN} -> {OUT_DIM}")
     print(f"MAX_DIM (homology dims computed): {MAX_DIM}")
 
