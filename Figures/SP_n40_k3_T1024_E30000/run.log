@@ -1,0 +1,33 @@
+Betti threshold: 0.0886
+Grokking at epoch ≈ 1400  |  snapshots: [1029, 1161, 1310, 1477, 1667, 1880, 2121]
+Computing 40×40 Wasserstein matrix on H_1...
+Done in 0.5s
+Mean intra-Grokked  distance: 0.0012
+Mean intra-Memorised distance: 1.0054
+Mean cross-condition distance: 1.0605
+Cross/intra ratio: 1.05  (>1 means separated)
+Computing layer-wise persistence...
+  grokked W1  H1_ent=0.932±0.610
+  grokked W2  H1_ent=1.238±0.621
+  grokked W3  H1_ent=0.000±0.000
+  memorised W1  H1_ent=5.630±0.078
+  memorised W2  H1_ent=4.409±0.160
+  memorised W3  H1_ent=0.000±0.000
+============================================================================
+Statistical comparison: Grokked vs Memorised  [W2 at convergence]  sparse parity n=40, k=3
+============================================================================
+Metric                       Grokked (μ±σ)     Memorised (μ±σ)         p  Sig
+----------------------------------------------------------------------------
+H0_entropy                3.218±0.280       5.447±0.053       0.0000  ***
+H0_total                 14.110±2.392     242.592±7.311       0.0000  ***
+H0_energy                16.374±14.059    359.914±125.328     0.0000  ***
+H0_max                    2.478±1.666       9.999±4.355       0.0000  ***
+H0_n                    256.000±0.000     256.000±0.000       1.0000  ns
+H1_entropy                1.238±0.621       4.409±0.160       0.0000  ***
+H1_total                  0.001±0.001       1.499±0.298       0.0000  ***
+H1_energy                 0.000±0.000       0.036±0.015       0.0000  ***
+H1_max                    0.000±0.000       0.072±0.048       0.0000  ***
+H1_n                      7.950±4.421     116.100±15.713      0.0000  ***
+============================================================================
+Codes: *** p<0.001  ** p<0.01  * p<0.05  . p<0.1  ns
+PC1: 4.5%   PC2: 4.1%
