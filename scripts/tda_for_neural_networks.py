@@ -85,16 +85,18 @@ def figpath(name):
 # spawn workers inherit it, so the wrapper scripts only have to set it
 # once in the parent process.
 TASK = os.environ.get("GROK_TASK", "add").strip().lower()
-if TASK not in ("add", "mul", "sparse_parity"):
-    raise ValueError(f"GROK_TASK must be one of add/mul/sparse_parity; got {TASK!r}")
+if TASK not in ("add", "add_flat", "mul", "sparse_parity"):
+    raise ValueError(
+        f"GROK_TASK must be one of add/add_flat/mul/sparse_parity; got {TASK!r}"
+    )
 
 # Hyperparameters — env-var-overridable so wrapper scripts can tune per task
 # without editing this file.
-MODULI     = [47]           # add/mul only. d=2 attempts archived in repo.
-TRAIN_FRAC = 0.40           # add/mul only.
-HIDDEN     = int(os.environ.get("GROK_HIDDEN",   "128"))
-N_EPOCHS   = int(os.environ.get("GROK_N_EPOCHS", "12000"))
-N_RUNS     = int(os.environ.get("GROK_N_RUNS",   "50"))
+MODULI     = [17,17]           # add/mul only. d=2 attempts archived in repo.
+TRAIN_FRAC = 0.06           # add/mul only.
+HIDDEN     = int(os.environ.get("GROK_HIDDEN",   "256"))
+N_EPOCHS   = int(os.environ.get("GROK_N_EPOCHS", "200_000"))
+N_RUNS     = int(os.environ.get("GROK_N_RUNS",   "5"))
 LR         = float(os.environ.get("GROK_LR",       "1e-3"))
 WD_GROK    = float(os.environ.get("GROK_WD_GROK",  "5.0"))
 WD_MEM     = float(os.environ.get("GROK_WD_MEM",   "0.0"))
@@ -106,7 +108,9 @@ SP_TRAIN   = int(os.environ.get("SP_TRAIN",  "1024"))
 
 # Derived constants. EFFECTIVE_MODULI is the "head-split" passed to
 # multi_loss / multi_acc — for sparse parity it's [2] (binary single head);
-# for add/mul it equals MODULI.
+# for add/mul/add_flat it equals MODULI. IN_DIM differs for add_flat
+# because each input element is one-hot over the WHOLE group |G| instead
+# of per-factor (so the model can't read the factorisation off the input).
 if TASK == "sparse_parity":
     D                = 1
     IN_DIM           = SP_N_BITS
@@ -115,7 +119,10 @@ if TASK == "sparse_parity":
     MAX_DIM          = 1
 else:
     D                = len(MODULI)
-    IN_DIM           = 2 * sum(MODULI)
+    if TASK == "add_flat":
+        IN_DIM       = 2 * int(np.prod(MODULI))     # 2 * |G|
+    else:
+        IN_DIM       = 2 * sum(MODULI)              # 2 * Σ m_i  (per-factor)
     OUT_DIM          = sum(MODULI)
     EFFECTIVE_MODULI = list(MODULI)
     MAX_DIM          = D
@@ -151,7 +158,12 @@ def _run_tag():
     if TASK == "sparse_parity":
         return f"SP_n{SP_N_BITS}_k{SP_K}_T{SP_TRAIN}_E{N_EPOCHS}"
     moduli_str = "x".join(str(m) for m in MODULI)
-    prefix = "Mul" if TASK == "mul" else "M"
+    if TASK == "mul":
+        prefix = "Mul"
+    elif TASK == "add_flat":
+        prefix = "Mflat"
+    else:
+        prefix = "M"
     return f"{prefix}{moduli_str}_E{N_EPOCHS}_F{TRAIN_FRAC:.2f}"
 
 
@@ -159,8 +171,11 @@ def _task_label():
     """Short human-readable description of the current task, for plot titles."""
     if TASK == "sparse_parity":
         return f"sparse parity n={SP_N_BITS}, k={SP_K}"
-    op = "·" if TASK == "mul" else "+"
-    return f"MODULI={MODULI} ({op} mod p)"
+    if TASK == "mul":
+        return f"MODULI={MODULI} (· mod p)"
+    if TASK == "add_flat":
+        return f"MODULI={MODULI} (+ mod p, flat input)"
+    return f"MODULI={MODULI} (+ mod p)"
 
 
 FIG_DIR = PROJECT_ROOT / "Figures" / _run_tag()
@@ -216,6 +231,8 @@ def make_dataset(moduli=None, frac=None, seed=0):
         return _make_dataset_sparse_parity(seed=seed)
     if TASK == "mul":
         return _make_dataset_mul(moduli=moduli, frac=frac, seed=seed)
+    if TASK == "add_flat":
+        return _make_dataset_add_flat(moduli=moduli, frac=frac, seed=seed)
     return _make_dataset_add(moduli=moduli, frac=frac, seed=seed)
 
 
@@ -241,6 +258,45 @@ def _make_dataset_add(moduli=None, frac=TRAIN_FRAC, seed=0):
         a_oh = [F.one_hot(torch.tensor(a[ix, i]), moduli[i]).float() for i in range(d)]
         b_oh = [F.one_hot(torch.tensor(b[ix, i]), moduli[i]).float() for i in range(d)]
         X    = torch.cat(a_oh + b_oh, dim=1)
+        y    = torch.tensor(labels[ix], dtype=torch.long)
+        return X, y
+
+    return enc(idx[:n]), enc(idx[n:])
+
+
+def _make_dataset_add_flat(moduli=None, frac=TRAIN_FRAC, seed=0):
+    """Modular addition with per-ELEMENT (rather than per-factor) one-hot
+    input encoding. Inputs are pairs (a, b) ∈ G × G with G = Z/m_1 × … ×
+    Z/m_d; each of a and b is one-hot encoded over |G| = ∏ m_i classes,
+    so IN_DIM = 2·|G| instead of 2·Σ m_i. Labels remain (a+b) per factor,
+    so the multi-head loss is unchanged.
+
+    Motivation: the per-factor encoding of _make_dataset_add hands the
+    factor decomposition to the model for free at d ≥ 2 (each factor's
+    one-hot block is a separate region of the input), which appears to
+    kill the memorisation basin and hence grokking. With the flat
+    encoding the model sees the whole group G as a single |G|-element
+    vocabulary and has to *discover* the factorisation.
+
+    At d=1 (|G| = m_1) this is bit-identical to _make_dataset_add modulo
+    RNG order. Useful for sanity-checking the new code path."""
+    if moduli is None:
+        moduli = MODULI
+    rng    = np.random.default_rng(seed)
+    elems  = np.array(list(iproduct(*(range(m) for m in moduli))))   # (|G|, d)
+    G      = len(elems)
+    pair_i = np.array(list(iproduct(range(G), range(G))))            # (|G|^2, 2)
+    a      = elems[pair_i[:, 0]]                                     # (|G|^2, d)
+    b      = elems[pair_i[:, 1]]
+    labels = (a + b) % np.array(moduli)                              # (|G|^2, d)
+
+    idx = rng.permutation(len(pair_i))
+    n   = int(frac * len(pair_i))
+
+    def enc(ix):
+        a_oh = F.one_hot(torch.tensor(pair_i[ix, 0]), G).float()     # (N, |G|)
+        b_oh = F.one_hot(torch.tensor(pair_i[ix, 1]), G).float()
+        X    = torch.cat([a_oh, b_oh], dim=1)                        # (N, 2|G|)
         y    = torch.tensor(labels[ix], dtype=torch.long)
         return X, y
 
@@ -718,9 +774,13 @@ def plot_grokking_transition(tda, runs, dim=1, savename="fig_grokking_transition
 
 # ── §9. Persistence diagrams at convergence (all dims) ────────────────────
 def plot_persistence_diagrams(tda, runs, layer=TDA_LAYER, savename="fig_persistence_diagrams.png"):
-    n_show = N_RUNS
-    dims   = list(range(MAX_DIM + 1))
-    nrows  = 2 * len(dims)               # (grokked × dims) then (memorised × dims)
+    # Cap columns so the figure stays viewable; subsample evenly across runs.
+    max_cols = 8
+    cols     = (list(range(N_RUNS)) if N_RUNS <= max_cols
+                else np.linspace(0, N_RUNS - 1, max_cols).round().astype(int).tolist())
+    n_show   = len(cols)
+    dims     = list(range(MAX_DIM + 1))
+    nrows    = 2 * len(dims)             # (grokked × dims) then (memorised × dims)
     fig, axes = plt.subplots(nrows, n_show, figsize=(2.8 * n_show, 2.6 * nrows),
                              squeeze=False)
     row_specs = []
@@ -728,14 +788,14 @@ def plot_persistence_diagrams(tda, runs, layer=TDA_LAYER, savename="fig_persiste
         for d in dims:
             row_specs.append((cond, d, f"H_{d}"))
 
-    for col in range(n_show):
+    for col, run_idx in enumerate(cols):
         for row, (cond, dim, dimlab) in enumerate(row_specs):
             ax   = axes[row, col]
-            snap = tda[cond][col][-1]
+            snap = tda[cond][run_idx][-1]
             dgm  = snap["dgms"][dim]
             fin  = dgm[np.isfinite(dgm[:, 1])]
             ent  = snap[f"H{dim}_entropy"]
-            te   = runs[cond][col]["history"]["test_acc"][-1]
+            te   = runs[cond][run_idx]["history"]["test_acc"][-1]
             if len(fin):
                 lim = fin.max() * 1.1
                 ax.scatter(fin[:, 0], fin[:, 1], s=12, c=C[cond],
@@ -748,7 +808,7 @@ def plot_persistence_diagrams(tda, runs, layer=TDA_LAYER, savename="fig_persiste
             if col == 0:
                 ax.set_ylabel(f"{cond}\n{dimlab}", fontsize=8, color=C[cond])
             if row == nrows - 1:
-                ax.set_xlabel(f"run {col+1}  te={te:.2f}", fontsize=7)
+                ax.set_xlabel(f"run {run_idx+1}  te={te:.2f}", fontsize=7)
     fig.suptitle(f"Persistence Diagrams at Convergence  [{layer}]   {_task_label()}",
                  fontsize=13, fontweight="bold")
     plt.tight_layout()
@@ -828,7 +888,7 @@ def plot_dendrogram(W_mat, final_labels, tklb, savename="fig_dendrogram.png"):
     N_tot = len(final_labels)
     upper = W_mat[np.triu_indices(N_tot, k=1)]
     Z     = linkage(upper, method="ward")
-    fig, ax = plt.subplots(figsize=(max(9, N_tot * 0.7), 5))
+    fig, ax = plt.subplots(figsize=(min(max(9, N_tot * 0.7), 24), 5))
     dend = dendrogram(Z, labels=tklb, ax=ax, leaf_font_size=10, color_threshold=0)
     for lbl, leaf in zip(ax.get_xticklabels(), dend["leaves"]):
         lbl.set_color(C[final_labels[leaf]])
