@@ -1,0 +1,66 @@
+Device : cpu
+PyTorch: 2.7.0
+Ripser : 0.6.14
+Task   : add_flat   (MODULI=[17, 17] (+ mod p, flat input))
+In/Out : 578 -> 128 -> 128 -> 34
+MAX_DIM (homology dims computed): 2
+train=3340  test=80181  input_dim=578  labels=(3340, 2)
+Will train 5×2 = 10 networks, 200,000 epochs each.
+Checkpoints per run: 43
+Figures will be written to: /Users/costis/Nextcloud/Computing/Python/Grokking/Figures/Mflat17x17_E200000_F0.04
+
+── GROKKED  (weight_decay=5.0)  [pool=5] ──
+  [ 1/5] seed= 0  train_acc=1.000  test_acc=0.759  [1691s]
+  [ 2/5] seed= 1  train_acc=1.000  test_acc=0.758  [1692s]
+  [ 3/5] seed= 2  train_acc=1.000  test_acc=0.765  [1692s]
+  [ 4/5] seed= 3  train_acc=1.000  test_acc=0.554  [1692s]
+  [ 5/5] seed= 4  train_acc=1.000  test_acc=0.745  [1693s]
+
+── MEMORISED  (weight_decay=0.0)  [pool=5] ──
+  [ 1/5] seed= 4  train_acc=1.000  test_acc=0.002  [4218s]
+  [ 2/5] seed= 2  train_acc=1.000  test_acc=0.002  [4219s]
+  [ 3/5] seed= 1  train_acc=1.000  test_acc=0.003  [4219s]
+  [ 4/5] seed= 0  train_acc=1.000  test_acc=0.002  [4220s]
+  [ 5/5] seed= 3  train_acc=1.000  test_acc=0.002  [4223s]
+
+Total training time: 98.7 min
+Computing persistence diagrams for W2  (max_dim=2)  [pool=5] ...
+Done in 7.6s
+Betti threshold: 3.0497
+No run reached test_acc ≥ 95% — try increasing N_EPOCHS.
+Computing 10×10 Wasserstein matrix on H_1...
+Done in 0.1s
+Mean intra-Grokked  distance: 2.3131
+Mean intra-Memorised distance: 18.9524
+Mean cross-condition distance: 42.8788
+Cross/intra ratio: 2.26  (>1 means separated)
+Computing layer-wise persistence...
+  grokked W1  H1_ent=3.940±0.262
+  grokked W2  H1_ent=3.860±0.189
+  grokked W3  H1_ent=3.874±0.301
+  memorised W1  H1_ent=3.674±0.164
+  memorised W2  H1_ent=4.879±0.083
+  memorised W3  H1_ent=3.263±0.137
+============================================================================
+Statistical comparison: Grokked vs Memorised  [W2 at convergence]  MODULI=[17, 17] (+ mod p, flat input)
+============================================================================
+Metric                       Grokked (μ±σ)     Memorised (μ±σ)         p  Sig
+----------------------------------------------------------------------------
+H0_entropy                4.805±0.014       4.784±0.023       0.0952  .
+H0_total                246.307±1.727     860.268±17.046      0.0079  **
+H0_energy               499.048±5.545     6860.427±763.647     0.0079  **
+H0_max                    2.419±0.019      27.475±8.535       0.0079  **
+H0_n                    128.000±0.000     128.000±0.000       1.0000  ns
+H1_entropy                3.860±0.189       4.879±0.083       0.0079  **
+H1_total                  5.468±1.347      55.172±3.482       0.0079  **
+H1_energy                 0.744±0.221      27.112±1.690       0.0079  **
+H1_max                    0.287±0.035       1.050±0.074       0.0079  **
+H1_n                     67.400±10.781    175.800±13.288      0.0119  *
+H2_entropy                0.131±0.262       5.051±0.096       0.0097  **
+H2_total                  0.007±0.015      30.190±4.045       0.0097  **
+H2_energy                 0.000±0.000       6.903±1.273       0.0097  **
+H2_max                    0.005±0.009       0.523±0.066       0.0097  **
+H2_n                      0.400±0.800     211.800±19.446      0.0097  **
+============================================================================
+Codes: *** p<0.001  ** p<0.01  * p<0.05  . p<0.1  ns
+PC1: 28.4%   PC2: 16.2%

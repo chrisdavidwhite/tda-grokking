@@ -1,0 +1,12 @@
+Device : cpu
+PyTorch: 2.7.0
+Ripser : 0.6.14
+Task   : add_flat   (MODULI=[17, 17] (+ mod p, flat input))
+In/Out : 578 -> 512 -> 512 -> 34
+MAX_DIM (homology dims computed): 2
+train=3340  test=80181  input_dim=578  labels=(3340, 2)
+Will train 5×2 = 10 networks, 200,000 epochs each.
+Checkpoints per run: 43
+Figures will be written to: /Users/costis/Nextcloud/Computing/Python/Grokking/Figures/Mflat17x17_E200000_F0.04
+
+── GROKKED  (weight_decay=5.0)  [pool=5] ──
